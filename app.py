@@ -1,14 +1,13 @@
 import os
 import sys
 
-from PyQt5.QtGui import QIcon, QImageReader, QImage, QPixmap
+from PyQt5.QtGui import QIcon, QImageReader, QImage, QPixmap, QTransform
 from PyQt5.QtCore import Qt, QSize, pyqtSignal
 from PyQt5.QtWidgets import QWidget, QAction, QMenu, QMainWindow, QVBoxLayout, QLabel, QDockWidget
 from PyQt5.QtWidgets import QListWidget, QScrollArea, QMessageBox, QFileDialog, QListWidgetItem, QApplication
 from PyQt5.QtWidgets import QApplication, QWidget, QInputDialog
+from PIL import Image as PilImage
 
-
-import copy
 from functools import partial
 
 from toolBar import ToolBar
@@ -27,14 +26,16 @@ from PyQt5.QtWidgets import (QApplication, QDialog, QVBoxLayout, QLineEdit,
                              QFileDialog, QPushButton, QLabel)
 
 class CustomSaveDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, default_dir=None):
         super(CustomSaveDialog, self).__init__(parent)
         self.setWindowTitle('Save File')
         layout = QVBoxLayout(self)
+        self.dirpath = None
 
         # Directory selection
         self.dirLineEdit = QLineEdit(self)
         self.browseButton = QPushButton('Browse...', self)
+        self.dirLineEdit.setText(default_dir)
         self.browseButton.clicked.connect(self.browseDirectory)
         layout.addWidget(QLabel('选择储存地址:'))
         layout.addWidget(self.dirLineEdit)
@@ -44,10 +45,10 @@ class CustomSaveDialog(QDialog):
         self.levelLineEdit = QLineEdit(self)
         layout.addWidget(QLabel('输入线路等级:'))
         layout.addWidget(self.levelLineEdit)
-
-        self.nameLineEdit = QLineEdit(self)
-        layout.addWidget(QLabel('输入岩馆名字:'))
-        layout.addWidget(self.nameLineEdit)
+        
+        self.colorLineEdit = QLineEdit(self)
+        layout.addWidget(QLabel('输入线路颜色:'))
+        layout.addWidget(self.colorLineEdit)
 
         # Save button
         self.saveButton = QPushButton('Save', self)
@@ -64,17 +65,28 @@ class CustomSaveDialog(QDialog):
     def saveFile(self):
         dirPath = self.dirLineEdit.text().strip()
         level = self.levelLineEdit.text().strip()
-        name = self.nameLineEdit.text().strip()
-        if dirPath and level and name:
+        color = self.colorLineEdit.text().strip()
+        if dirPath and level and color:
             # Formulate file name and save path
-            fileName = f"{name}_{level}.png"
+            i = 0
+            while True:
+                fileName = f"{color}_{level}_{i}"
+                if fileName in os.listdir(dirPath):
+                    i += 1
+                else:
+                    break
             self.filePath = os.path.join(dirPath, fileName)
+            self.dirpath = dirPath
             # Here, instead of actually saving a file, we just accept the dialog
             # In a real application, you would save the file to `self.filePath`
             self.accept()
             
+            
     def getFilePath(self):
         return self.filePath
+    
+    def getFileDirectory(self):
+        return self.dirpath
 
 
 
@@ -140,18 +152,21 @@ class MainWindow(QMainWindow, WindowMixin):
 
     def __init__(self, defaultFilename=None):
         super().__init__()
-
+        # self.showFullScreen()  # This will display the window in full-screen mode
         self.dirty = True
         self.mImgList = []
         self.dirname = None
         self._beginner = True
-
-        self.image_out_np = None
+        self.rotation_degree = 0  # Attribute to track rotation degree
+        self.image_out_np = {}
         self.default_save_dir = None
         # Application state
         self.filePath = None
         self.mattingFile = None
-        self.resize(14000, 800)
+        self.defaultWidth = 1000  # Default width when not in full screen
+        self.defaultHeight = 1000  # Default height when not in full screen
+        self.resize(self.defaultWidth, self.defaultHeight)
+        # self.setGeometry(1000, 1000, self.defaultWidth, self.defaultHeight)
         listLayout = QVBoxLayout()
         listLayout.setContentsMargins(0, 0, 0, 0)
         matResultShow = ResizedQWidget()
@@ -200,7 +215,7 @@ class MainWindow(QMainWindow, WindowMixin):
         }
         self.scrollArea = scroll
         self.canvas.scrollRequest.connect(self.scrollRequest)
-
+        self.scrollArea.setWidgetResizable(True)
         self.setCentralWidget(scroll)
         # self.addDockWidget(Qt.RightDockWidgetArea, self.resultdock)
         self.addDockWidget(Qt.RightDockWidgetArea, self.filedock)
@@ -208,8 +223,7 @@ class MainWindow(QMainWindow, WindowMixin):
 
         self.dockFeatures = QDockWidget.DockWidgetClosable | QDockWidget.DockWidgetFloatable
         # self.resultdock.setFeatures(
-        #     self.resultdock.features() ^ self.dockFeatures)
-    
+        #     self.resultdock.features() ^ self.dockFeatures)s
         
 
         # Actions
@@ -228,6 +242,8 @@ class MainWindow(QMainWindow, WindowMixin):
 
         crop = action('&标记图像', self.createShapeCropping, 'C', '裁剪')
         confirm_crop = action('&确认', self.confirm_select, 'Crl+C', '确认')
+        rotate = action('&旋转', self.rotateImage, 'Crl+R', '旋转')
+        cancel = action('&取消上个标记', self.cancelSelect, 'Crl+Z', '取消上个标记')
         self.scalers = {
             self.FIT_WINDOW: self.scaleFitWindow,
             self.FIT_WIDTH: self.scaleFitWidth,
@@ -237,7 +253,7 @@ class MainWindow(QMainWindow, WindowMixin):
 
         # store actions for further handling
         self.actions = struct(save=save, open_file=open_file,
-                              open_dir=open_dir,
+                              open_dir=open_dir, rotate=rotate, cancel=cancel,
                               # open_next_img=open_next_img, open_pre_img=open_pre_img,
                             matting=matting, crop=crop, confirm_crop = confirm_crop)
 
@@ -248,7 +264,7 @@ class MainWindow(QMainWindow, WindowMixin):
 
         # set toolbar
         self.tools = self.toolbar('Tools')
-        self.actions.all = (save, open_file, open_dir,
+        self.actions.all = (save, open_file, open_dir, rotate, cancel,
                             # open_pre_img, open_next_img, 
                             matting, crop, confirm_crop)
         addActions(self.tools, self.actions.all)
@@ -285,14 +301,17 @@ class MainWindow(QMainWindow, WindowMixin):
             return dict(line_color=s.line_color.getRgb(),
                         fill_color=s.fill_color.getRgb(),
                         points=[(p.x(), p.y()) for p in s.points])
-        print(self.shapes, self.canvas.shapes)
         choice = self.showSingleChoiceDialog()
         if choice:
             print("User selected:", choice)
             if choice == '起步点':
-                self.shapes[choice].append(self.canvas.shapes[-1])
+                self.shapes[choice].append(format_shape(self.canvas.shapes[-1]))
             else:
                 self.shapes[choice] = format_shape(self.canvas.shapes[-1])
+        self.actions.save.setEnabled(True)
+        self.actions.rotate.setEnabled(True)
+        self.actions.matting.setEnabled(True)
+        self.actions.crop.setEnabled(True)
         
     def showSingleChoiceDialog(self):
         options = ['起步点', '结束点', '裁剪边框']
@@ -348,7 +367,34 @@ class MainWindow(QMainWindow, WindowMixin):
             filename = self.mImgList[currIndex]
             if filename:
                 self.loadFile(filename)
+                
+    def cancelSelect(self):
+        if len(self.canvas.shapes) > 1:
+            self.canvas.shapes = self.canvas.shapes[:-1]
+            self.canvas.update
+                
+    def rotateImage(self):
+        if self.image:
+            # Rotate the image
+            transform = QTransform()
+            transform.rotate(90)
+            self.image = self.image.transformed(transform)
+            
+            # Update the canvas with the rotated image
+            self.canvas.loadPixmap(QPixmap.fromImage(self.image))
+            self.canvas.adjustSize()
+            # self.scrollArea.adjustSize()
+            # self.scrollArea.update()
+            self.canvas.update()
 
+            # # Update the stored image data (if you're storing the original image data)
+            # self.imageData = self.image.bits().asstring(self.image.byteCount())
+            self.rotation_degree += 90
+            self.rotation_degree %= 360
+            # Resize the canvas or the scroll area
+            # self.image.adjustSize()  # If pic is a QLabel
+              # If you are using a QScrollArea to display the image
+            
     def loadFile(self, filePath=None):
         self.resetState()
         self.canvas.setEnabled(False)
@@ -360,10 +406,24 @@ class MainWindow(QMainWindow, WindowMixin):
             fileWidgetItem.setSelected(True)
 
         if filePath and os.path.exists(filePath):
-            # load image
-            self.imageData = read(filePath, None)
+            # Load image using Pillow to check for EXIF orientation
+            pil_img = PilImage.open(filePath)
+            exif_data = pil_img._getexif()
+            orientation_tag = 274  # EXIF orientation tag
+            if exif_data and orientation_tag in exif_data:
+                orientation = exif_data[orientation_tag]
+                rotation_degrees = {
+                    3: 180,
+                    6: 270,
+                    8: 90
+                }.get(orientation, 0)
+                pil_img = pil_img.rotate(rotation_degrees, expand=True)
+                # Convert the Pillow image back to QImage
+                image = QImage(pil_img.tobytes(), pil_img.width, pil_img.height, QImage.Format_RGB888)#.rgbSwapped()
+            else:
+                # For non-JPEG images or JPEGs without orientation data
+                image = QImage(filePath)
 
-        image = QImage.fromData(self.imageData)
         if image.isNull():
             self.errorMessage(u'Error opening file',
                               u'<p>Make sure <i>%s</i> is a valid image file.' % filePath)
@@ -385,6 +445,13 @@ class MainWindow(QMainWindow, WindowMixin):
         value = self.scalers[self.FIT_WINDOW if initial else self.zoomMode]()
         self.zoomWidget.setValue(int(100 * value))
 
+    def toggleFullScreen(self):
+        if self.isFullScreen():
+            self.showNormal()  # Exit full screen
+            self.resize(self.defaultWidth, self.defaultHeight)  # Resize to default size
+        else:
+            self.showFullScreen()  # Enter full screen
+            
     def scaleFitWindow(self):
         """Figure out the size of the pixmap in order to fit the main widget."""
         e = 2.0  # So that no scrollbars are generated.
@@ -414,17 +481,21 @@ class MainWindow(QMainWindow, WindowMixin):
         msg_box.setWindowTitle(title)
         msg_box.setText(text)
         msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        msg_box.setDefaultButton(QMessageBox.No)
+        msg_box.setDefaultButton(QMessageBox.Yes)
         
         retval = msg_box.exec_()
         return retval == QMessageBox.Yes
 
     def createShapeCropping(self):
         assert self.beginner()
-        confirmation = self.askForConfirmation('标记图像', "拖动鼠标绘画边框，绘画后点击确认选择（起步点，结束点，裁剪）")
+        confirmation = self.askForConfirmation('标记图像', "拖动鼠标绘画边框，绘画后点击确认（选择当前边框是起步点，结束点，裁剪）")
         if confirmation:
-            previous_number_shapes = len(self.canvas.shapes)
             self.canvas.setEditing(False)
+            self.actions.save.setEnabled(False)
+            self.actions.rotate.setEnabled(False)
+            self.actions.matting.setEnabled(False)
+            self.actions.crop.setEnabled(False)
+            
                 
 
     def toggleDrawMode(self, edit=True):
@@ -435,7 +506,7 @@ class MainWindow(QMainWindow, WindowMixin):
     
     def generate(self):
         self.process = Process()
-        self.image_out_np = self.process.process(self.filePath, self.shapes)
+        self.image_out_np = self.process.process(self.filePath, self.shapes, self.rotation_degree)
         # self.showResultImg(self.image_out_np)
         self.actions.save.setEnabled(True)
         
@@ -472,37 +543,18 @@ class MainWindow(QMainWindow, WindowMixin):
 
     def _saveFile(self, saved_path):
         if saved_path:
-            Grab_cut.resultSave(saved_path, self.image_out_np)
+            Process.resultSave(saved_path, self.image_out_np)
             self.setClean()
             self.statusBar().showMessage('Saved to  %s' % saved_path)
             self.statusBar().show()
 
-    # def saveFileDialog(self):
-    #     caption = '%s - 选择储存地址' % __appname__
-    #     filters = 'File (*%s)' % 'png'
-    #     if self.default_save_dir is not None and len(self.default_save_dir):
-    #         openDialogPath = self.default_save_dir
-    #     else:
-    #         openDialogPath = self.currentPath()
-
-    #     print(openDialogPath)
-    #     dlg = QFileDialog(self, caption, openDialogPath, filters)
-    #     dlg.setDefaultSuffix('png')
-    #     dlg.setAcceptMode(QFileDialog.AcceptSave)
-    #     filenameWithoutExtension = os.path.splitext(self.filePath)[0]
-    #     dlg.selectFile(filenameWithoutExtension)
-    #     dlg.setOption(QFileDialog.DontUseNativeDialog, False)
-    #     if dlg.exec_():
-    #         return dlg.selectedFiles()[0]
-    #     return ''
     def saveFileDialog(self,):
-        # if self.default_save_dir is not None and len(self.default_save_dir):
-        #     openDialogPath = self.default_save_dir
-        # else:
-        #     openDialogPath = self.currentPath()
-        dialog = CustomSaveDialog(parent=self)
+        dialog = CustomSaveDialog(parent=self, default_dir = self.default_save_dir)
         if dialog.exec_() == QDialog.Accepted:
             filePath = dialog.getFilePath()
+            file_dir = dialog.getFileDirectory()
+            if file_dir is not None:
+                self.default_save_dir = file_dir
             print("File path to save:", filePath)
             return filePath
         return ''
