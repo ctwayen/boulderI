@@ -5,7 +5,7 @@ from PyQt5.QtGui import QIcon, QImageReader, QImage, QPixmap, QTransform
 from PyQt5.QtCore import Qt, QSize, pyqtSignal
 from PyQt5.QtWidgets import QWidget, QAction, QMenu, QMainWindow, QVBoxLayout, QLabel, QDockWidget
 from PyQt5.QtWidgets import QListWidget, QScrollArea, QMessageBox, QFileDialog, QListWidgetItem, QApplication
-from PyQt5.QtWidgets import QApplication, QWidget, QInputDialog
+from PyQt5.QtWidgets import QApplication, QWidget, QInputDialog, QComboBox
 from PIL import Image as PilImage
 
 from functools import partial
@@ -17,6 +17,7 @@ from zoomWidget import ZoomWidget
 from grab_cut import Grab_cut
 from generate_single_line import Process
 import cv2
+from io import BytesIO
 
 __appname__ = 'BoulderBody'
 defaultFilename = '.'
@@ -25,12 +26,53 @@ import os
 from PyQt5.QtWidgets import (QApplication, QDialog, QVBoxLayout, QLineEdit,
                              QFileDialog, QPushButton, QLabel)
 
+from PyQt5.QtWidgets import QDialog, QVBoxLayout, QListWidget, QPushButton
+
+class ColorSelectionDialog(QDialog):
+    def __init__(self, parent=None):
+        super(ColorSelectionDialog, self).__init__(parent)
+        self.setWindowTitle('Select Color')
+        self.layout = QVBoxLayout(self)
+
+        # List Widget for Colors
+        self.colorListWidget = QListWidget()
+        self.layout.addWidget(self.colorListWidget)
+
+        # Populate the list with color options
+        self.colors = {
+            "黑色 (Black)": ((0, 180), (0, 255), (0, 50)),    # Hue, Saturation, Value
+            "灰色 (Gray)": ((0, 180), (0, 50), (50, 200)),   # Low saturation
+            "白色 (White)": ((0, 180), (0, 50), (200, 255)), # High value
+            "红色 (Red)": ((0, 20), (0, 255), (0, 255)),
+            "橙色 (Orange)": ((5, 25), (0, 255), (0, 255)),
+            "黄色 (Yellow)": ((25, 45), (0, 255), (0, 255)),
+            "绿色 (Green)": ((45, 99), (0, 255), (0, 255)),
+            "蓝色 (Blue)": ((100, 130), (0, 255), (0, 255)),
+            "紫色 (Purple)": ((130, 160), (0, 255), (0, 255)),
+            "金色 (Gold)": ((0, 180), (0, 255), (0, 255)),   # Distinguished by higher saturation and mid-value
+            "银色 (Silver)": ((0, 180), (0, 255), (0, 255)),      # Low saturation, high value
+        }
+
+        for color in self.colors.keys():
+            self.colorListWidget.addItem(color)
+
+        # OK Button
+        self.okButton = QPushButton('OK')
+        self.okButton.clicked.connect(self.accept)
+        self.layout.addWidget(self.okButton)
+
+    def selectedColor(self):
+        # Returns the color name and hue range
+        currentItemText = self.colorListWidget.currentItem().text()
+        return currentItemText.split('(')[1][:-1], self.colors[currentItemText]
+    
 class CustomSaveDialog(QDialog):
     def __init__(self, parent=None, default_dir=None):
         super(CustomSaveDialog, self).__init__(parent)
         self.setWindowTitle('Save File')
         layout = QVBoxLayout(self)
         self.dirpath = None
+        self.color = parent.color
 
         # Directory selection
         self.dirLineEdit = QLineEdit(self)
@@ -41,15 +83,14 @@ class CustomSaveDialog(QDialog):
         layout.addWidget(self.dirLineEdit)
         layout.addWidget(self.browseButton)
 
-        # Additional input fields
-        self.levelLineEdit = QLineEdit(self)
-        layout.addWidget(QLabel('输入线路等级:'))
-        layout.addWidget(self.levelLineEdit)
+        # Line level selection replaced with QComboBox
+        self.levelComboBox = QComboBox(self)
+        # Add the options for line level
+        lineLevels = ['v0', 'v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7p', 'unknown']
+        self.levelComboBox.addItems(lineLevels)
+        layout.addWidget(QLabel('选择线路等级:'))
+        layout.addWidget(self.levelComboBox)
         
-        self.colorLineEdit = QLineEdit(self)
-        layout.addWidget(QLabel('输入线路颜色:'))
-        layout.addWidget(self.colorLineEdit)
-
         # Save button
         self.saveButton = QPushButton('Save', self)
         self.saveButton.clicked.connect(self.saveFile)
@@ -64,8 +105,8 @@ class CustomSaveDialog(QDialog):
 
     def saveFile(self):
         dirPath = self.dirLineEdit.text().strip()
-        level = self.levelLineEdit.text().strip()
-        color = self.colorLineEdit.text().strip()
+        level = self.levelComboBox.currentText()  # Get the selected line level
+        color = self.color
         if dirPath and level and color:
             # Formulate file name and save path
             i = 0
@@ -75,12 +116,11 @@ class CustomSaveDialog(QDialog):
                     i += 1
                 else:
                     break
-            self.filePath = os.path.join(dirPath, fileName)
+            self.filePath = f'{dirPath}/{fileName}'
             self.dirpath = dirPath
             # Here, instead of actually saving a file, we just accept the dialog
             # In a real application, you would save the file to `self.filePath`
             self.accept()
-            
             
     def getFilePath(self):
         return self.filePath
@@ -243,7 +283,7 @@ class MainWindow(QMainWindow, WindowMixin):
         crop = action('&标记图像', self.createShapeCropping, 'C', '裁剪')
         confirm_crop = action('&确认', self.confirm_select, 'Crl+C', '确认')
         rotate = action('&旋转', self.rotateImage, 'Crl+R', '旋转')
-        cancel = action('&取消上个标记', self.cancelSelect, 'Crl+Z', '取消上个标记')
+        cancel = action('&重置', self.cancelSelect, 'Crl+Z', '重置')
         self.scalers = {
             self.FIT_WINDOW: self.scaleFitWindow,
             self.FIT_WIDTH: self.scaleFitWidth,
@@ -369,9 +409,14 @@ class MainWindow(QMainWindow, WindowMixin):
                 self.loadFile(filename)
                 
     def cancelSelect(self):
-        if len(self.canvas.shapes) > 1:
-            self.canvas.shapes = self.canvas.shapes[:-1]
-            self.canvas.update
+        self.canvas.shapes = []
+        self.color = None
+        self.canvas.update
+        self.shapes = {
+            '裁剪边框': None,
+            '起步点': [],
+            '结束点': None
+        }
                 
     def rotateImage(self):
         if self.image:
@@ -398,7 +443,6 @@ class MainWindow(QMainWindow, WindowMixin):
     def loadFile(self, filePath=None):
         self.resetState()
         self.canvas.setEnabled(False)
-
         # highlight the file item
         if filePath and self.fileListWidget.count() > 0:
             index = self.mImgList.index(filePath)
@@ -419,10 +463,17 @@ class MainWindow(QMainWindow, WindowMixin):
                 }.get(orientation, 0)
                 pil_img = pil_img.rotate(rotation_degrees, expand=True)
                 # Convert the Pillow image back to QImage
-                image = QImage(pil_img.tobytes(), pil_img.width, pil_img.height, QImage.Format_RGB888)#.rgbSwapped()
+                image = QImage(pil_img.tobytes(), pil_img.width, pil_img.height, QImage.Format_RGB888)
             else:
                 # For non-JPEG images or JPEGs without orientation data
                 image = QImage(filePath)
+                
+            self.canvas.shapes = []
+            self.shapes = {
+                '裁剪边框': None,
+                '起步点': [],
+                '结束点': None
+            }
 
         if image.isNull():
             self.errorMessage(u'Error opening file',
@@ -432,7 +483,12 @@ class MainWindow(QMainWindow, WindowMixin):
         self.status('Loaded %s' % os.path.basename(filePath))
         self.image = image
         self.filePath = filePath
-        self.canvas.loadPixmap(QPixmap.fromImage(image))
+        buffer = BytesIO()
+        pil_img.save(buffer, format="PNG")
+        qt_pixmap = QPixmap()
+        qt_pixmap.loadFromData(buffer.getvalue(), "PNG")
+        # self.canvas.loadPixmap(QPixmap.fromImage(image))
+        self.canvas.loadPixmap(qt_pixmap)
         self.canvas.setEnabled(True)
         self.adjustScale(initial=True)
         self.paintCanvas()
@@ -506,7 +562,11 @@ class MainWindow(QMainWindow, WindowMixin):
     
     def generate(self):
         self.process = Process()
-        self.image_out_np = self.process.process(self.filePath, self.shapes, self.rotation_degree)
+        colorDialog = ColorSelectionDialog(self)
+        if colorDialog.exec_() == QDialog.Accepted:
+            selectedColorName, (hueRange, saturationRange, valueRange) = colorDialog.selectedColor()
+            self.image_out_np = self.process.process(self.filePath, self.shapes, self.rotation_degree, hueRange, saturationRange, valueRange)
+            self.color = selectedColorName
         # self.showResultImg(self.image_out_np)
         self.actions.save.setEnabled(True)
         
@@ -576,7 +636,8 @@ class MainWindow(QMainWindow, WindowMixin):
     def scrollRequest(self, delta, orientation):
         units = - delta / (8 * 15)
         bar = self.scrollBars[orientation]
-        bar.setValue(bar.value() + bar.singleStep() * units)
+        bar.setValue(bar.value() + int(bar.singleStep() * units))
+
 
 
 
