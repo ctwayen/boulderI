@@ -1,4 +1,4 @@
-# boulderbuddy
+# boulderI
 This is a simple GUI for editing bouldering lines
 这是一个简单的用来标记抱石线路的图形界面
 
